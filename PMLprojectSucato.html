@@ -1252,7 +1252,10 @@ this project retains the ensemble approach.</p>
             cvtd_timestamp, new_window, num_window)) %&gt;%
   mutate(user_name = factor(user_name))
 testing1 &lt;- predict(trainingPP, newdata = testing)
-predict(rfFit, newdata = testing1)
+v1 &lt;- predict(rfFit, newdata = testing1)
+v2 &lt;- predict(gbmFit, newdata = testing1)
+v3 &lt;- predict(treefit, newdata = testing1)
+voting(v1, v2, v3)
 </code></pre>
 
 <pre><code>##  [1] B A C A A E D B A A B C B A E E A B B B
