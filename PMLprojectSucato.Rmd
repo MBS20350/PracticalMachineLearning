@@ -1,0 +1,206 @@
+---
+title: "JHS Practical Machine Learning Project"
+output: 
+  html_document: 
+    keep_md: true
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(cache=TRUE, warning=FALSE, message=FALSE, error=FALSE)
+```
+
+<center>
+# Evaluating Exercise with Machine Learning  
+### by Mark Sucato
+</center>
+
+### Executive Summary
+
+The HAR *WLE* dataset contains on-body sensor information from six participants 
+performing 10 repetitions of a unilateral dumbell biceps curl in five different 
+but specific manners.  A stacked ensemble of three different classification 
+tree-based models trained on a training set of 13,737 observations predicted a 
+validation set of 4,127 observations with 99.98% accuracy. 
+
+### Project objective and data
+
+**Objective**:  predict the manner of exercise for twenty observations drawn 
+from the Human Activity Recognition *Weight Lifting Exercises* dataset. 
+
+The HAR *WLE* dataset contains on-body sensor information from six participants 
+performing 10 repetitions of a unilateral dumbell biceps curl in five 
+different but specific manners 
+(http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har).
+Each observation is a time-stamped capture of sensor data; one complete 
+repetition by a given participant includes multiple sequential observations. 
+The 2013 *Qualitative Activity Recognition of Weight Lifting Exercises* HAR paper 
+by Velloso et al, available at the same website, analyzed time slices of 
+sequential data to assess repetitions ^1 . Because the provided test set for this project only contains 
+ single-observation data excerpted from the greater dataset, sequential data 
+analysis is not feasible for this project. 
+
+1. Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. 
+Qualitative Activity Recognition of Weight Lifting Exercises. 
+Proceedings of 4th International Conference in Cooperation with SIGCHI 
+(Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.    
+
+### Exploratory Data Analysis
+
+The provided training set includes 19,622 observations of 160 variables.  100 
+of these variables, all seemingly summary calculations from the raw sensor 
+data, are almost entirely missing.  Because this project will not rely on any 
+sequential analysis, the time stamp observations, row labels, and movement 
+window indicators are also unnecessary.  A *skim* summary of the parsed data 
+is provided below.     
+
+```{r EDA}
+library(tidyverse)
+library(caret)
+library(skimr)
+library(doParallel)
+
+training <- read_csv("pml-training.csv")
+testing <- read_csv("pml-testing.csv")
+
+training <- training %>%
+  select(where(~mean(is.na(.))< 0.9)) %>%
+  select(-c(X1, raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp, new_window, num_window)) %>%
+  mutate(classe=factor(classe), user_name = factor(user_name))
+fix_windows_histograms()   # skimr package utility to fix histogram printing on Windows
+skim(training)
+```  
+
+The resultant data set only includes complete cases.  Examination of the 
+numeric variable summary statistics and thumbnail histograms indicate many of 
+the features display non-Gaussian indications.  The analysis will use variable 
+transformations to standardize the data.  Due to the presence of negative and 
+zero values, a Yeo-Johnson transformation is utilized.    
+
+For this analysis, the *training* data is partitioned into *training* 
+and *validation* subsets.  The *testing* data does not contain the *classe* 
+variable and is dedicated to a prediction test of 20 observations.
+
+A Principal Component Analysis variance-explained plot of the *training* set 
+indicates PCA transformation could reduce the number of features and thus 
+improve computational efficiency.  The variance explained per principal 
+component asymptotically reaches a limit around the 20th principal component.       
+
+```{r EDA2, fig.align = 'center', fig.width = 11}
+inTrain <- createDataPartition(training$classe, p = 0.7, list = FALSE)
+training <- training[inTrain, ]
+validation <- training[-inTrain, ]
+
+trainingPCA <- prcomp(x = training[-c(1,54)], scale = F, center = T)
+pcaVar <- trainingPCA$sdev^2
+varExp <- pcaVar / sum(pcaVar)
+plot(varExp, xlab = "Principal Component", ylab = "Proportion of Variance Explained", 
+	ylim = c(0,.3), type = "b")
+```
+
+### Modeling
+
+This analysis uses an ensemble of three different machine learning algorithms 
+stacked via a simple majority voting scheme.  If all three models disagree, the 
+model with the highest accuracy on the *validation* set provides the answer. 
+As discussed above, *Yeo-Johnson* and *pca* transformations are used to 
+standardize and scale the data. *Center* and *scale* transformations are 
+prerequisites for *pca* transformation, and a *near-zero variance* transformation 
+is used to check for isolated features that might bias the predictions.
+
+The *caret* calculated PCA analysis indicates slightly more than the preliminary 
+estimate of principle components are required to capture 95% of the variance. 
+Additionally, the lack of additional variable removal during *caret* preprocessing 
+indicates no features possess near-zero variance.  
+
+```{r modeling}
+trainingPP <- preProcess(training[, -54], method = c("center", "scale", "YeoJohnson", "nzv", "pca"))
+training1 <- predict(trainingPP, newdata = training)
+validation1 <- predict(trainingPP, newdata = validation)
+trainingPP  # No NSV features; passed 53, ignored user, transformed 
+```
+
+To improve accuracy, all three algorithms in the stacked ensemble utilize some form of boosting or 
+bagging.  All were chosen for their predictive abilities with classification 
+problems.  The three algorithms in the ensemble are:
+* *Random Forest* via *ranger*
+* *Stochastic Gradient Boosting* via *gbm*
+* *Bagged Classification and Regression Tree* via *treebag*
+
+To prevent overfitting, k-fold cross-validation using 10 folds and five repetitions 
+is utilized.  These numbers were chosen as a compromise between modeling desires 
+and required computation time.  For computational efficiency, parallel 
+computation via a multi-core processor and the *doParallel* package is employed. 
+
+```{r modeling2}
+set.seed(12345)
+cl <- makePSOCKcluster(3)  # doParallel package for parallel processing
+registerDoParallel(cl)  # doParallel package for parallel processing
+
+modControl <- trainControl(method = "repeatedcv", number = 10, repeats = 5)
+gbmFit <- train(classe ~ ., data = training1, method = "gbm", trControl = modControl, verbose = FALSE)
+rfFit <- train(classe ~ ., data = training1, method = "ranger", trControl = modControl, verbose = FALSE)
+treefit <- train(classe ~ ., data = training1, method = "treebag", trControl = modControl, verbose = FALSE)
+
+stopCluster(cl)  # doParallel package for parallel processing
+
+gbmVote <- predict(gbmFit, newdata = validation1)
+rfVote <- predict(rfFit, newdata = validation1)
+treeVote <- predict(treefit, newdata = validation1)
+voting <- function(a, b, c) {
+  for(i in 1:length(a)) {
+    if(b[i] == c[i]) a[i] = b[i]
+  }
+  return(a)
+}
+voteTally <- voting(rfVote, gbmVote, treeVote)
+```
+
+The random forest's out-of-bag prediction error estimate based on the training 
+set is provided below.  
+
+```{r modeling3}
+rfFit$finalModel
+```
+
+The three model's accuracies on the validation set are provided below. The 
+random forest model perfectly predicted the validation set, exceeding the ~98% 
+OOB training set-derived estimate, and the bagged tree model only missed 
+perfection by a few elements.  The boosted gradient tree performed slightly 
+worse at ~86% accuracy.
+
+```{r modeling4}
+postResample(pred = rfVote, obs = validation1$classe)
+postResample(pred = treeVote, obs = validation1$classe)
+postResample(pred = gbmVote, obs = validation1$classe)
+```
+
+The final ensemble confusion matrix and accuracies on the validation set are 
+provided below.  In one case, the less accurate models outvoted the random 
+forest model to the minute detriment of overall accuracy.  Because of the tiny 
+difference and the upside potential of the ensemble against future unknown data, 
+this project retains the ensemble approach.
+
+```{r modeling5}
+confusionMatrix(voteTally, validation1$classe)
+```
+
+### Predictions
+
+The predictions of the testing set variables are provided below.
+ 
+```{r predictions}
+testing <- testing %>%
+  select(where(~mean(is.na(.))< 0.9)) %>%
+  select(-c(X1, raw_timestamp_part_1, raw_timestamp_part_2,
+            cvtd_timestamp, new_window, num_window)) %>%
+  mutate(user_name = factor(user_name))
+testing1 <- predict(trainingPP, newdata = testing)
+predict(rfFit, newdata = testing1)
+```
+
+### Conclusions
+
+The simple majority stacked ensemble utilized predicts the validation set with 
+99.98% accuracy. The individual algorithms performance on the *validation* set 
+indicate the ensemble approach is probably unnecessary in this case, but that 
+might not be the case with other datasets.    
